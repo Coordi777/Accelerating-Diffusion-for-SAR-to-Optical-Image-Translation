@@ -1,0 +1,33 @@
+train_config:
+  input_perturbation: 0.1
+  pretrained_model_path: /path/to/official/diffusion
+  sar_image_path: /path/to/sar/data/csv/file
+  opt_image_path: /path/to/opt/data/csv/file
+  max_train_samples: 200
+  output_dir: /path/to/train/output/dirs
+  seed: 3407
+  resolution: 256
+  train_batch_size: 8
+  num_train_epochs: 100
+  gradient_accumulation_steps: 2
+  learning_rate: 8e-6
+  lr_scheduler: "cosine"
+  use_ema: True
+  logging_dir: logs
+  checkpointing_steps: 5000
+  checkpoints_total_limit: 30
+  validation_ouputdir: /path/to/val/output/dirs
+  validation_steps: 5000
+  loss_type: "huber"
+  num_ddim_timesteps: 50
+  unet_checkpoint: /path/to/pre-trained/diffusion_pytorch_model
+  gan_loss_type: unsaturated
+  dataloader_num_workers: 8
+
+
+unet:
+  prediction_type: "epsilon"
+  mixed_precision: "fp16"
+
+
+
