@@ -587,10 +587,7 @@ args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_ep
 if args.validation_steps > 0:
     images = []
     images_opt = []
-    image_val = ["data/Sen1-2/ROIs2017_winter/s1_58/ROIs2017_winter_s1_58_p3.png",
-                 "data/Sen1-2/ROIs1970_fall/s1_30/ROIs1970_fall_s1_30_p8.png",
-                 "data/Sen1-2/ROIs2017_winter/s1_146/ROIs2017_winter_s1_146_p221.png",
-                 "data/Sen1-2/ROIs1868_summer/s1_54/ROIs1868_summer_s1_54_p550.png"]
+    image_val = ["/path/to/val/images"]
     for image_path in image_val:
         image = Image.open(image_path)
         image_tensor = transforms.Compose([
@@ -600,10 +597,7 @@ if args.validation_steps > 0:
         images.append(image_tensor)
     batch_val = torch.stack(images, dim=0)
     os.makedirs(args.validation_ouputdir, exist_ok=True)
-    image_opt = ["data/Sen1-2/ROIs2017_winter/s2_58/ROIs2017_winter_s2_58_p3.png",
-                 "data/Sen1-2/ROIs1970_fall/s2_30/ROIs1970_fall_s2_30_p8.png",
-                 "data/Sen1-2/ROIs2017_winter/s2_146/ROIs2017_winter_s2_146_p221.png",
-                 "data/Sen1-2/ROIs1868_summer/s2_54/ROIs1868_summer_s2_54_p550.png"]
+    image_opt = ["/path/to/val/images"]
     for image_path in image_opt:
         image = Image.open(image_path)
         image_tensor = transforms.Compose([
