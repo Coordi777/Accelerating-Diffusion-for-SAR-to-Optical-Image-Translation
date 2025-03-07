@@ -4,6 +4,11 @@ This is the official implementation of [Accelerating Diffusion for SAR-to-Optica
 
 This repository is based on [diffusers🤗](https://github.com/huggingface/diffusers).
 
+## Updates
+📣[2025.3.7] Pre-trained model weights are now publicly available.
+
+📣[2025.3.5] Make the inference script more readable.
+
 ## Overview
 
 ### Abstract
@@ -29,6 +34,14 @@ bash train.sh
 ### Requirement
 
 Make sure your environment is set up with PyTorch, Diffusers, and Accelerate according to the official requirements.
+
+### Checkponits
+
+We provide pre-trained weights (including both the ​model and ​discriminator) trained on the `SEN-12` dataset using the ​LCM_ADV:
+- [​Baidu Netdisk](https://pan.baidu.com/s/18uKtx53davt9RMReXm02Hw?pwd=bzjz)
+- [Google Drive](https://drive.google.com/file/d/1JiE00Bb_Jvww56TjaXMEoCeuOa223gJO/view?usp=drive_link)
+
+**Note:** Due to limitations in the training process, the model may not always generate high-quality optical images in all scenarios.
 
 ### Cite
 
