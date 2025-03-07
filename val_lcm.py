@@ -10,6 +10,7 @@ from pathlib import Path
 import json
 from safetensors import safe_open
 import PIL.Image as Image
+from datetime import datetime
 
 import accelerate
 import datasets
@@ -35,17 +36,16 @@ transform_sar = transforms.Compose([
     transforms.Normalize((0.5), (0.5)),
 ])
 
-# 设置随机种子
+transform_opt = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Resize((256, 256)),
+    transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5)),
+])
 seed = 3407
 torch.manual_seed(seed)
 random.seed(seed)
 np.random.seed(seed)
 device = "cuda:2"
-
-unet_config_path = "/path/to/unet/config.json"
-with open(unet_config_path) as unet_config_file:
-    unet_config = json.load(unet_config_file)
-    unet_type = unet_config.pop("type", None)
 
 def safe_load(model_path):
     assert "safetensors" in model_path
@@ -55,9 +55,7 @@ def safe_load(model_path):
             state_dict[k] = f.get_tensor(k) 
     return state_dict
 
-unet_checkpoint = "/path/to/unet/checkpoints"
-unet_checkpoint_org = "/path/to/org/unet/checkpoints"
-# unet_model = SAR2OptUNetv3(**unet_config)
+unet_checkpoint = "/path/to/model/safetensors"
 unet_model = SAR2OptUNetv3(
             sample_size=256,
             in_channels=4,
@@ -87,30 +85,30 @@ print('load unet safetensos done!')
 unet_model.eval().to(device)
 
 lcm_scheduler = LCMScheduler(num_train_timesteps=1000)
-
 sample_list = []
-file_path = "selected_opt.txt"
+gt_list = []
+file_path = "/path/to/val/image/csv/file"
 with open(file_path, "r") as file:
     lines = file.readlines()
+selected_lines = random.sample(lines, 20)
+for line in selected_lines:
+    sample_list.append(line.strip())
+    gt_list.append(line.strip().replace("s1_", "s2_"))
 
-sample_name_list = [line.strip() for line in lines]
-
-nums_step = 16
-
-save_path = f"/path/to/save/step_{nums_step}_v2"
+nums_step = 8
+ti = datetime.now().strftime("%Y%m%d_%H%M")
+save_path = f"/path/to/save/nums_step{nums_step}_{ti}"
 os.makedirs(save_path, exist_ok=True)
 
 with torch.no_grad():
-    for i,opt_image_path in enumerate(sample_list):
+    for i,(opt_image_path, gt_image_path) in enumerate(zip(sample_list, gt_list)):
+
         filename = os.path.basename(opt_image_path)
         lcm_scheduler.set_timesteps(nums_step, device=device)
         timesteps = lcm_scheduler.timesteps
         pred_latent = torch.randn(size=[1, 3, 256, 256], device=device)
         image = Image.open(opt_image_path)
-        image_tensor = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
-        ])(image)
+        image_tensor = transform_sar(image)
         image_tensor = torch.unsqueeze(image_tensor, 0)
         image_tensor = image_tensor.to(device)
 
@@ -123,6 +121,9 @@ with torch.no_grad():
                                                     sample=pred_latent,
                                                     return_dict=False)
         samples = denoised.cpu()
-        combined_tensor = samples
+        gt_image = Image.open(gt_image_path)
+        gt_tensor = transform_opt(gt_image)
+        gt_tensor = torch.unsqueeze(gt_tensor, 0).cpu()
+        combined_tensor = combined_tensor = torch.cat([gt_tensor, samples], dim=3)
         save_image(combined_tensor, os.path.join(save_path, f'idx{i}_{filename}_ema.png'),
             normalize=True, value_range=(-1, 1), nrow=3)
