@@ -27,16 +27,53 @@ from copy import deepcopy
 from safetensors import safe_open
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from diffusers import DDPMScheduler, UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from models import SAR2OptUNetv2
+from models import SAR2OptUNetv2, SAR2OptUNetv3
 from dataloader_pair import pair_Dataset, pair_Dataset_csv
 from utils import update_args_from_yaml, safe_load
 from torchvision.utils import make_grid, save_image
+from color_loss import Blur
+
+class DDPMSchedulerColor(DDPMScheduler):
+    def step_org(
+        self,
+        model_output,
+        timestep,
+        sample,
+        generator=None,
+        return_dict=True,
+    ):
+        t = timestep
+        if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
+            model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
+        else:
+            predicted_variance = None
+
+        # 1. compute alphas, betas
+        alpha_prod_t = self.alphas_cumprod[t]
+        beta_prod_t = 1 - alpha_prod_t
+
+        pred_original_sample_list = []
+        bz = sample.shape[0]
+        for i in range(bz):
+            pred_original_sample_temp = (sample[i] - beta_prod_t[i] ** (0.5) * model_output[i]) / alpha_prod_t[i] ** (0.5)
+            pred_original_sample_list.append(pred_original_sample_temp)
+            pred_original_sample = torch.stack(pred_original_sample_list, dim=0)
+        # 3. Clip or threshold "predicted x_0"
+        if self.config.thresholding:
+            pred_original_sample = self._threshold_sample(pred_original_sample)
+        elif self.config.clip_sample:
+            pred_original_sample = pred_original_sample.clamp(
+                -self.config.clip_sample_range, self.config.clip_sample_range
+            )
+
+        return pred_original_sample
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -241,27 +278,30 @@ def parse_args():
     return parser
 
 
-def inference(model,vae, batch_val,ddpm_scheduler,samples):
+def inference(model,ddpm_scheduler,samples, batch_val):
     device = model.device
     model.eval()
     
     with torch.no_grad():
         pred_latent = samples
+
         for timestep in tqdm(ddpm_scheduler.timesteps, desc=f"Inference:"):
-            model_pred = model(pred_latent, timestep, sar_image=batch_val)
+            latent_to_pred = torch.cat((pred_latent, batch_val), dim=1)
+            model_pred = model(latent_to_pred, timestep)
             step = ddpm_scheduler.step(
                 model_output=model_pred,
                 timestep=timestep,
                 sample=pred_latent)
             pred_latent = step.prev_sample
-    samples = vae.decode(step.pred_original_sample).sample
+
+    samples = step.pred_original_sample
     model.train()
     return samples
 
 logger = get_logger(__name__, log_level="INFO")
 parser = parse_args()
 args = parser.parse_args()
-# yaml 更新训练参数等
+
 with open(args.config_yaml, 'r') as f:
     yaml_args = yaml.safe_load(f)
 update_args_from_yaml(yaml_args, args, parser)
@@ -270,7 +310,7 @@ os.makedirs(args.output_dir, exist_ok=True)
 logging_dir = os.path.join(args.output_dir, args.logging_dir)
 now = datetime.datetime.now()
 trail_name = now.strftime("%m%d-%H%M")
-yaml_save_path = os.path.join(args.output_dir, f"{trail_name}.yaml")  # 替换为你想要保存的目录和文件名
+yaml_save_path = os.path.join(args.output_dir, f"{trail_name}.yaml")  
 with open(yaml_save_path, 'w') as f:
     yaml.dump(yaml_args, f)
 
@@ -299,36 +339,36 @@ else:
 if args.seed is not None:
     set_seed(args.seed)
 
-noise_scheduler = DDPMScheduler.from_pretrained(os.path.join(args.pretrained_model_path,"scheduler"))
+noise_scheduler = DDPMSchedulerColor.from_pretrained(os.path.join(args.pretrained_model_path,"scheduler"))
 
-unet_config_path = os.path.join(os.path.join(args.pretrained_model_path,"unet/config.json"))
-with open(unet_config_path, 'r') as f:
-    unet_config = json.load(f)
-unet = SAR2OptUNetv2(**unet_config)
-
-def safe_load(model_path):
-    assert "safetensors" in model_path
-    state_dict = {}
-    with safe_open(model_path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            state_dict[k] = f.get_tensor(k) 
-    return state_dict
-unet_checkpoint = os.path.join(args.pretrained_model_path,"unet/diffusion_pytorch_model.safetensors")
-unet.load_state_dict(safe_load(unet_checkpoint), strict=False)
-print('load unet safetensos done!')
-
-# unet = SAR2OptUNet.from_pretrained(os.path.join(args.pretrained_model_path,"unet"))
-vae = AutoencoderKL.from_pretrained(os.path.join(args.pretrained_model_path,"vae"))
-
-vae.requires_grad_(False)
-vae.eval()
+unet = SAR2OptUNetv3(
+            sample_size=256,
+            in_channels=4,
+            out_channels=3,
+            layers_per_block=2,
+            block_out_channels=(128, 128, 256, 256, 512, 512),
+            down_block_types=(
+                "DownBlock2D",
+                "DownBlock2D",
+                "DownBlock2D",
+                "DownBlock2D",
+                "AttnDownBlock2D",
+                "DownBlock2D",
+            ),
+            up_block_types=(
+                "UpBlock2D",
+                "AttnUpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+            ),
+)
 unet.train()
 
 if args.use_ema:
-    # ema_unet = SAR2OptUNetv2(**unet_config)
-    # ema_unet = SAR2OptUNet.from_pretrained(os.path.join(args.pretrained_model_path,"unet"))
     ema_unet = deepcopy(unet)
-    ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
+    ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DModel, model_config=ema_unet.config)
 
 if args.allow_tf32:
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -359,7 +399,6 @@ transform_opt = transforms.Compose([
 ])
 
 train_dataset = pair_Dataset_csv(args.sar_image_path, args.opt_image_path, transform_sar, transform_opt)
-# DataLoaders creation:
 train_dataloader = torch.utils.data.DataLoader(
     train_dataset,
     shuffle=True,
@@ -381,7 +420,6 @@ lr_scheduler = get_scheduler(
     num_training_steps=args.max_train_steps * accelerator.num_processes,
 )
 
-# Prepare everything with our `accelerator`.
 unet,optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
     unet, optimizer, train_dataloader, lr_scheduler
 )
@@ -400,36 +438,24 @@ elif accelerator.mixed_precision == "bf16":
 num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
 if overrode_max_train_steps:
     args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-# Afterwards we recalculate our number of training epochs
 args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-
-# Function for unwrapping if model was compiled with `torch.compile`.
-def unwrap_model(model):
-    model = accelerator.unwrap_model(model)
-    model = model._orig_mod if is_compiled_module(model) else model
-    return model
 
 if args.validation_steps > 0:
     images = []
     images_opt = []
-    image_val = ["data/Sen1-2/ROIs2017_winter/s1_58/ROIs2017_winter_s1_58_p3.png",
-                 "data/Sen1-2/ROIs1970_fall/s1_30/ROIs1970_fall_s1_30_p8.png",
-                 "data/Sen1-2/ROIs2017_winter/s1_146/ROIs2017_winter_s1_146_p221.png",
-                 "data/Sen1-2/ROIs1868_summer/s1_54/ROIs1868_summer_s1_54_p550.png"]
+    image_val =["/path/to/val/images"]
+
     for image_path in image_val:
         image = Image.open(image_path)
         image_tensor = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
+            transforms.Normalize((0.5), (0.5))
         ])(image)
         images.append(image_tensor)
     batch_val = torch.stack(images, dim=0)
     os.makedirs(args.validation_ouputdir, exist_ok=True)
-    image_opt = ["data/Sen1-2/ROIs2017_winter/s2_58/ROIs2017_winter_s2_58_p3.png",
-                 "data/Sen1-2/ROIs1970_fall/s2_30/ROIs1970_fall_s2_30_p8.png",
-                 "data/Sen1-2/ROIs2017_winter/s2_146/ROIs2017_winter_s2_146_p221.png",
-                 "data/Sen1-2/ROIs1868_summer/s2_54/ROIs1868_summer_s2_54_p550.png"]
+    image_opt = ["/path/to/val/images"]
+    
     for image_path in image_opt:
         image = Image.open(image_path)
         image_tensor = transforms.Compose([
@@ -465,14 +491,14 @@ progress_bar = tqdm(
     desc="Steps",
     disable=not accelerator.is_local_main_process,
 )
-vae.to(accelerator.device)
+blur_rgb = Blur(3)
+blur_rgb.to(accelerator.device)
 for epoch in range(first_epoch, args.num_train_epochs):
     train_loss = 0.0
     for step, batch in enumerate(train_dataloader):
-        with accelerator.accumulate([unet,vae]):
+        with accelerator.accumulate([unet]):
             sar_image, opt_image = batch
-            latents = vae.encode(opt_image.to(weight_dtype),return_dict=False)[0].sample()
-            latents = latents * vae.config.scaling_factor
+            latents = opt_image
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -497,9 +523,8 @@ for epoch in range(first_epoch, args.num_train_epochs):
                 noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
             else:
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            # Get the text embedding for conditioning
-            # encoder_hidden_states = sar_encoder()
+            
+            noisy_latents_input = torch.cat((noisy_latents, sar_image), dim=1)
 
             # Get the target for loss depending on the prediction type
             if args.prediction_type is not None:
@@ -514,14 +539,16 @@ for epoch in range(first_epoch, args.num_train_epochs):
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
             # Predict the noise residual and compute loss
-            model_pred = unet(noisy_latents, timesteps, sar_image=sar_image.to(weight_dtype))
+            model_pred = unet(noisy_latents_input, timesteps)
+            # t_temp = timesteps.cpu().numpy()
+            # x_0 = noise_scheduler.step_org(model_pred,timesteps,noisy_latents)
+            # blur_rgb1 = blur_rgb(x_0)
+            # blur_rgb2 = blur_rgb(opt_image)
+            # color_l = F.mse_loss(blur_rgb1, blur_rgb2)
 
             if args.snr_gamma is None:
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
             else:
-                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                # This is discussed in Section 4.2 of the same paper.
                 snr = compute_snr(noise_scheduler, timesteps)
                 mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
                     dim=1
@@ -534,6 +561,7 @@ for epoch in range(first_epoch, args.num_train_epochs):
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                 loss = loss.mean()
+            # loss = color_l + loss
 
             # Gather the losses across all processes for logging (if we use distributed training).
             avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
@@ -590,21 +618,22 @@ for epoch in range(first_epoch, args.num_train_epochs):
             if accelerator.sync_gradients and (global_step - 1) % args.validation_steps == 0:
                 torch.cuda.empty_cache()
                 latent = torch.randn(
-                            size=[4, 4, 256 // 8, 256 // 8], #4 //8
+                            size=[4, 3, 256, 256], #4 //8
                             device=accelerator.device,
                             generator=torch.Generator(accelerator.device).manual_seed(3407))
                 batch_val = batch_val.to(accelerator.device)
+
                 if args.use_ema:
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
 
-                    samples_ema = inference(unet, vae, batch_val,noise_scheduler,latent)  
+                    samples_ema = inference(unet, noise_scheduler,latent, batch_val)  
                     save_image(samples_ema.to(accelerator.device),
                                 os.path.join(args.validation_ouputdir, f'debug_images_ema_{global_step}.jpg'),
                                 normalize=True, value_range=(-1, 1), nrow=4)
                     ema_unet.restore(unet.parameters())             
                 
-                samples = inference(unet,vae ,batch_val,noise_scheduler,latent)                    
+                samples = inference(unet, noise_scheduler,latent, batch_val)                    
                 save_image(samples.to(accelerator.device),
                                 os.path.join(args.validation_ouputdir, f'debug_images_{global_step}.jpg'),
                                 normalize=True, value_range=(-1, 1), nrow=4)
